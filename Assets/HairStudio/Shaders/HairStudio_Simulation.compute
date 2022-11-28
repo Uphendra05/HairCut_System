@@ -1,0 +1,480 @@
+﻿#pragma kernel ResetCohesionMap
+#pragma kernel BuildCohesionMap
+#pragma kernel PhysicStep
+#pragma kernel RenderingStep
+
+#include "HairStudio_Math.cginc"
+#include "HairStudio_Data.cginc" 
+
+static const float floatToInt = 1000000;
+static const float intToFloat = 0.000001f;
+
+struct ColliderInfo
+{
+	float3 pos;
+	float radius;
+};
+
+struct Strand
+{
+	uint firstSegmentIndex;
+	uint nbSegments;
+	float4 localRotation;
+};
+
+struct Segment
+{
+	int canMove;
+    float rate;
+	float previousDeltaTime;
+	float length;
+	float3 pos;
+	float3 previousPos;
+	float3 initialPos;
+	float3 arbitraryUp;
+	float4 frame;
+	float4 localRestRotation; 
+};
+
+RWStructuredBuffer<Strand> _Strands;
+RWStructuredBuffer<Segment> _Segments;
+RWStructuredBuffer<SegmentForShading> _SegmentsForShading;
+RWStructuredBuffer<ColliderInfo> _ColliderInfos;
+RWStructuredBuffer<int4> _VelocityGrid;
+RWStructuredBuffer<uint> _DensityGrid;
+
+// grid
+float _VoxelSize;
+uint _GridResolution;
+float3 _Center;
+
+// physics
+float3 _Force;
+float4 _ScalpRotation;
+float4x4 _ScalpTransform;
+float _DeltaTime, _ExtrapolationTime, _Gravity, _Drag, _Radius, _LocalStiffness, _GlobalStiffnessStart, _GlobalStiffnessEnd, _Friction, _Repulsion;
+uint _LengthIterationCount, _StiffnessIterationCount, _StrandCount, _ColliderCount;
+bool _Extrapolate, _UseDFTL, _Locked;
+
+float3 GetGridCoord(float3 pos)
+{
+    float3 localPos = pos - _Center;
+	float3 gridCoord = floor(localPos / _VoxelSize);
+	return gridCoord + (float) _GridResolution * 0.5f;
+}
+
+int GetGridIndex(float3 pos)
+{
+    float3 coord = GetGridCoord(pos);
+	return coord.x * square(_GridResolution) + coord.y * _GridResolution + coord.z;
+}
+
+float3 GetVoxel(float3 pos)
+{
+    float3 coord = GetGridCoord(pos);
+	return (coord - (float) _GridResolution * 0.5f) * _VoxelSize + _Center;
+}
+
+// Apply length constraint using Dynamic Follow The Leader
+// as described in paper Fast Simulation of Inextensible Hair and Fur
+void ApplyLengthConstraintDFTL(Strand strand)
+{
+	for (uint i = strand.firstSegmentIndex + 1; i < strand.nbSegments + strand.firstSegmentIndex; i++)
+    {
+		Segment seg = _Segments[i];
+		if (seg.canMove == 0 || seg.rate <= _GlobalStiffnessStart)
+		{
+			continue;
+		}
+		Segment previous = _Segments[i - 1];
+
+        float3 dir = normalize(seg.pos - previous.pos);
+
+        float3 savedPos = seg.pos;
+            
+		// position is set at the exact distance from previous, to ensure inextensibility
+		_Segments[i].pos = previous.pos + dir * previous.length;
+
+		// we apply a velocity correction to i using i + 1 projection, relying on position based dynamics
+		_Segments[i - 1].previousPos += _Segments[i].pos - savedPos;
+	}
+}
+
+// Apply length constraint using Position Based Dynamics
+void ApplyLengthConstraintMultiplePBD(Strand strand)
+{
+    for (uint iter = 0; iter < _LengthIterationCount; iter++)
+    {
+		for (uint i = strand.firstSegmentIndex; i < strand.nbSegments + strand.firstSegmentIndex - 1; i++)
+        {
+			Segment seg = _Segments[i];
+			Segment next = _Segments[i + 1];
+			if ((seg.canMove == 0 && next.canMove == 0) || next.rate <= _GlobalStiffnessStart)
+				continue;
+
+            float3 toNext = next.pos - seg.pos;
+            float currentDist = length(toNext);
+			float error = (currentDist - seg.length) / currentDist;
+            if (seg.canMove && next.canMove)
+            {
+				_Segments[i].pos += error * 0.5f * toNext;
+				_Segments[i + 1].pos -= error * 0.5f * toNext;
+			}
+            else if (seg.canMove)
+            {
+				_Segments[i].pos += error * toNext;
+			}
+            else if (next.canMove)
+            {
+				_Segments[i + 1].pos -= error * toNext;
+			}
+        }
+    }
+}
+
+void ManageCollisions(Strand strand)
+{
+	for (uint i = strand.firstSegmentIndex + 1; i < strand.nbSegments + strand.firstSegmentIndex; i++)
+	{
+		Segment seg = _Segments[i];
+		if (seg.canMove == 0 || seg.rate <= _GlobalStiffnessStart)
+			continue;
+		
+		bool collision = false;
+		for (uint c = 0; c < _ColliderCount; c++)
+		{
+			ColliderInfo ci = _ColliderInfos[c];
+			float3 colToSeg = seg.pos - ci.pos;
+			float radii = _Radius + ci.radius;
+			if (SqrLength(colToSeg) < square(radii))
+			{
+				// collision detected
+				float penetration = radii - length(colToSeg);
+				seg.pos += normalize(colToSeg) * penetration;
+				collision = true;
+			}
+		}
+		if (collision)
+		{
+			// if segment collide, its energy is absorbed by the collider and velocity is canceled
+			seg.previousPos = seg.pos;
+			_Segments[i] = seg;
+		}
+	}
+}
+
+void ApplyLocalStiffness(Strand strand)
+{
+	// updating the frame of the first segment
+	_Segments[strand.firstSegmentIndex].frame = MultQQ(_ScalpRotation, strand.localRotation);
+
+	//float stiffnessPerIteration = _LocalStiffness / ((float) _StiffnessIterationCount);
+	for (uint iter = 0; iter < _StiffnessIterationCount; iter++)
+	{
+		for (uint i = strand.firstSegmentIndex; i < strand.nbSegments + strand.firstSegmentIndex -1; i++)
+		{
+			Segment seg = _Segments[i];
+			Segment next = _Segments[i + 1];
+			if ((seg.canMove == 0 && next.canMove == 0) || next.rate <= _GlobalStiffnessStart)
+				continue;
+			
+
+			// we find the ideal position for next segment
+			float4 restRotation = MultQQ(seg.frame, seg.localRestRotation);
+			float3 localIdealPosition = MultQV(restRotation, _forward) * seg.length;
+			float3 idealPos = seg.pos + localIdealPosition;
+
+			float3 delta = idealPos - next.pos;
+			// TODO stiffness should be scaled with delta, to get more stiffness on large delta.
+			delta *= _LocalStiffness;
+
+			// we apply the delta between this node and the next, to fasten convergence
+			if (seg.canMove && next.canMove)
+			{
+				seg.pos -= delta * 0.5f;
+				next.pos += delta * 0.5f; 
+			}
+			else if (seg.canMove)
+			{
+				seg.pos -= delta;
+			}
+			else if (next.canMove)
+			{
+				next.pos += delta;
+			}
+
+			if (i != strand.firstSegmentIndex)
+			{
+				Segment previous = _Segments[i - 1];
+				seg.frame = QuaternionLookAt(seg.pos - previous.pos, previous.arbitraryUp);
+			}
+			next.frame = QuaternionLookAt(next.pos - seg.pos, seg.arbitraryUp);
+			_Segments[i] = seg;
+			_Segments[i + 1] = next;
+		}
+	}
+}
+
+void IntegrateLocal(Strand strand)
+{
+	for (uint i = strand.firstSegmentIndex; i < strand.nbSegments + strand.firstSegmentIndex; i++)
+	{
+		Segment seg = _Segments[i];
+		
+		// we continue if segment is locked
+		if (seg.canMove == 0 || seg.rate <= _GlobalStiffnessStart)
+			continue;
+		
+		// integration of velocity, gravity, force and drag
+		float3 velocity = seg.pos - seg.previousPos;
+		_Segments[i].previousPos = seg.pos;
+
+		// friction
+		if (_Friction != 0)
+		{
+			int velocityCount = _VelocityGrid[GetGridIndex(seg.pos)].w;
+			if (velocityCount > 0)
+			{
+				float3 voxelVelocity = float3(_VelocityGrid[GetGridIndex(seg.pos)].xyz) * intToFloat;
+				voxelVelocity /= float(velocityCount);
+				velocity = (1 - _Friction) * velocity + _Friction * voxelVelocity;
+			}
+		}
+		
+		// drag
+		velocity *= 1 - _Drag * _DeltaTime;
+
+		// external force
+		velocity += _Force;
+		
+		// gravity
+		velocity += _up * _Gravity * _DeltaTime;
+		
+		// hair/hair repulsion
+		if (_Repulsion != 0)
+		{
+			float inverseVoxelVolume = 1.0f / (_VoxelSize * _VoxelSize * _VoxelSize);
+			float3 baseVoxel = GetVoxel(seg.pos);
+			float3 repulsion;
+			for (float x = 0; x <= _VoxelSize + epsilon; x += _VoxelSize)
+				for (float y = 0; y <= _VoxelSize + epsilon; y += _VoxelSize)
+					for (float z = 0; z <= _VoxelSize + epsilon; z += _VoxelSize)
+					{
+						float3 voxel = baseVoxel + float3(x, y, z);
+						float3 voxelToSeg = seg.pos - voxel;
+						float voxelToSegVolume = abs(voxelToSeg.x * voxelToSeg.y * voxelToSeg.z);
+						float weight = 1.0f - voxelToSegVolume * inverseVoxelVolume;
+					
+						int index = GetGridIndex(seg.pos + float3(x, y, z));
+						float density = float(_DensityGrid[index]) * 0.000001f;
+						repulsion += normalize(voxelToSeg) * weight * density;
+					}
+			if (any(repulsion))
+			{
+				repulsion *= 0.125f;
+				velocity += repulsion * _Repulsion * 0.000001f * _DeltaTime;
+			}
+		}
+
+		// application of the final velocity
+		_Segments[i].pos += velocity;
+
+		// global stiffness
+		if (seg.rate <= _GlobalStiffnessEnd)
+		{
+			float3 initialPos = mul(_ScalpTransform, float4(seg.initialPos.xyz, 1)).xyz;
+			float stiffnessRate = 1 - saturate(invLerp(_GlobalStiffnessStart, _GlobalStiffnessEnd, seg.rate));
+			stiffnessRate = max(stiffnessRate, 0.01f);
+			float3 delta = (initialPos - _Segments[i].pos).xyz * stiffnessRate;
+			_Segments[i].pos += delta;
+		}
+	}
+}
+
+// move the segments according to scalp new transform if they are locked or above global stiffness start
+void MoveLockedSegments(Strand strand)
+{
+	for (uint i = strand.firstSegmentIndex; i < strand.nbSegments + strand.firstSegmentIndex; i++)
+	{
+		Segment seg = _Segments[i];
+		if (_Locked || seg.canMove == 0 || seg.rate <= _GlobalStiffnessStart)
+		{
+			float3 initialPos = mul(_ScalpTransform, float4(seg.initialPos.xyz, 1)).xyz;
+			_Segments[i].pos = initialPos;
+			// we also cancel the velocity if hair is locked.
+			if (_Locked)
+			{
+				_Segments[i].previousPos = initialPos;
+			}
+		}
+	}
+}
+
+void UpdateSegmentsForShading(Strand strand, bool extrapolate)
+{
+	for (uint i = strand.firstSegmentIndex; i < strand.nbSegments + strand.firstSegmentIndex; i++)
+	{
+		Segment seg = _Segments[i];
+		float3 tangent;
+		if (i == strand.firstSegmentIndex)
+		{
+			// this is the first segment. Tangent is the frame forward
+			tangent = MultQV(seg.frame, _forward);
+		}
+		else if (i == strand.firstSegmentIndex + strand.nbSegments - 1)
+		{
+			// this is the last segment. Tangent is set as the same as the previous segment
+			tangent = _SegmentsForShading[i - 1].tangent;
+		}
+		else
+		{
+			Segment prev = _Segments[i - 1];
+			Segment next = _Segments[i + 1];
+			tangent = (normalize(next.pos - seg.pos) + normalize(seg.pos - prev.pos)) * 0.5f;
+		}
+		
+		float3 extrapolatedPos = seg.pos;
+		if (extrapolate && seg.canMove != 0 && seg.rate > _GlobalStiffnessStart)
+		{
+			// extrapolation of the velocity with gravity and drag
+			float3 velocity = seg.pos - seg.previousPos;
+			velocity *= 1 - _Drag * _ExtrapolationTime;
+			velocity += _up * _Gravity * _ExtrapolationTime;
+			extrapolatedPos += velocity * _ExtrapolationTime;
+			
+			// extrapolation of the global stiffness
+			if (seg.rate <= _GlobalStiffnessEnd)
+			{
+				float3 initialPos = mul(_ScalpTransform, float4(seg.initialPos.xyz, 1)).xyz;
+				float stiffnessRate = 1 - saturate(invLerp(_GlobalStiffnessStart, _GlobalStiffnessEnd, seg.rate));
+				stiffnessRate = max(stiffnessRate, 0.01f);
+				float3 delta = (initialPos - extrapolatedPos).xyz * stiffnessRate; // * _ExtrapolationTime;
+				extrapolatedPos += delta;
+			}
+			
+			// depenetration
+			bool collision = false;
+			for (uint c = 0; c < _ColliderCount; c++)
+			{
+				ColliderInfo ci = _ColliderInfos[c];
+				float3 colToSeg = extrapolatedPos - ci.pos;
+				float radii = _Radius + ci.radius;
+				if (SqrLength(colToSeg) < square(radii))
+				{
+					// collision detected
+					float penetration = radii - length(colToSeg);
+					extrapolatedPos += normalize(colToSeg) * penetration;
+					collision = true;
+				}
+			}
+		}
+
+		SegmentForShading segForShading =
+		{
+			extrapolatedPos,
+			tangent,
+			seg.arbitraryUp
+		};
+		_SegmentsForShading[i] = segForShading;
+	}
+}
+
+[numthreads(64, 1, 1)]
+void ResetCohesionMap(uint GIndex : SV_GroupIndex, uint3 GId : SV_GroupID)
+{
+	uint index = GIndex + GId.x * uint(64);
+	
+	if (index > _GridResolution * _GridResolution * _GridResolution)
+		return;
+	
+	_DensityGrid[index] = 0;
+	_VelocityGrid[index] = float4(0, 0, 0, 0);
+}
+
+[numthreads(64, 1, 1)] 
+void BuildCohesionMap(uint GIndex : SV_GroupIndex, uint3 GId : SV_GroupID)
+{
+	uint index = GIndex + GId.x * uint(64);
+	if (index >= _StrandCount)
+		return;
+	
+	Strand strand = _Strands[index];
+
+	if (_Locked || _GlobalStiffnessStart >= 1)
+		return;
+
+	if (_Friction == 0 && _Repulsion == 0)
+		return;
+	
+	float inverseVoxelVolume = 1.0f / (_VoxelSize * _VoxelSize * _VoxelSize);
+	uint segIndex = strand.firstSegmentIndex;
+	for (uint j = 1; j < strand.nbSegments; j++)
+	{
+		Segment seg = _Segments[segIndex + j];
+		float3 baseVoxel = GetVoxel(seg.pos);
+		for (float x = 0; x <= _VoxelSize + epsilon; x += _VoxelSize)
+			for (float y = 0; y <= _VoxelSize + epsilon; y += _VoxelSize)
+				for (float z = 0; z <= _VoxelSize + epsilon; z += _VoxelSize)
+				{
+					float3 voxel = baseVoxel + float3(x, y, z);
+					float3 voxelToSeg = seg.pos - voxel;
+					float voxelToSegVolume = abs(voxelToSeg.x * voxelToSeg.y * voxelToSeg.z);
+					float weight = 1.0f - voxelToSegVolume * inverseVoxelVolume;
+					int index = GetGridIndex(seg.pos + float3(x, y, z));
+					
+					if (_Repulsion != 0)
+					{
+						InterlockedAdd(_DensityGrid[index], (int) (weight * 1000000));
+					}
+					
+					if (_Friction != 0)
+					{
+						float3 velocity = seg.pos - seg.previousPos;
+						InterlockedAdd(_VelocityGrid[index].x, (int) (velocity.x * weight * floatToInt));
+						InterlockedAdd(_VelocityGrid[index].y, (int) (velocity.y * weight * floatToInt));
+						InterlockedAdd(_VelocityGrid[index].z, (int) (velocity.z * weight * floatToInt));
+						InterlockedAdd(_VelocityGrid[index].w, 1);
+					}
+				}
+	}
+}
+
+[numthreads(64, 1, 1)]
+void PhysicStep(uint GIndex : SV_GroupIndex, uint3 GId : SV_GroupID)
+{
+	uint index = GIndex + GId.x * uint(64);
+	if (index >= _StrandCount)
+		return;
+	
+	Strand strand = _Strands[index];
+
+	MoveLockedSegments(strand);
+	
+	if (!_Locked && _GlobalStiffnessStart < 1)
+	{
+		IntegrateLocal(strand);
+		if (_UseDFTL)
+			ApplyLengthConstraintDFTL(strand);
+		else
+			ApplyLengthConstraintMultiplePBD(strand);
+		ApplyLocalStiffness(strand);
+		ManageCollisions(strand);
+	}
+	UpdateSegmentsForShading(strand, false);
+}
+
+[numthreads(64, 1, 1)]
+void RenderingStep(uint GIndex : SV_GroupIndex, uint3 GId : SV_GroupID)
+{
+	uint index = GIndex + GId.x * uint(64);
+	if (index >= _StrandCount)
+		return;
+	Strand strand = _Strands[index];
+
+	MoveLockedSegments(strand);
+	UpdateSegmentsForShading(strand, _Extrapolate);
+}
+
+
+
+
